@@ -45,6 +45,6 @@ def build_df(root):
                     templates.append(segment)
 
                     sample_id += 1   
-                    templates_df = pd.concat(templates, ignore_index=True)
+    templates_df = pd.concat(templates, ignore_index=True)
 
     return templates_df
