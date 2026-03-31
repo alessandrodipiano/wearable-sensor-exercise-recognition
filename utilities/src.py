@@ -168,3 +168,268 @@ def compare_sensor_means(templates_df, exec_types=("correct", "low_amplitude")):
             print(sensor_means.to_string())
  
     return results
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+def remove_short_true_segments(mask, min_len):
+    mask = mask.copy()
+    groups = (mask != mask.shift()).cumsum()
+
+    for _, group in mask.groupby(groups):
+        if bool(group.iloc[0]) and len(group) < min_len:
+            mask.loc[group.index] = False
+
+    return mask
+
+
+def fill_short_false_gaps(mask, max_gap_len):
+    mask = mask.copy()
+    groups = (mask != mask.shift()).cumsum()
+
+    segments = []
+    for _, group in mask.groupby(groups):
+        segments.append({
+            "value": bool(group.iloc[0]),
+            "start": group.index[0],
+            "end": group.index[-1],
+            "length": len(group)
+        })
+
+    for i in range(1, len(segments) - 1):
+        prev_seg = segments[i - 1]
+        curr_seg = segments[i]
+        next_seg = segments[i + 1]
+
+        if (
+            prev_seg["value"] is True and
+            curr_seg["value"] is False and
+            next_seg["value"] is True and
+            curr_seg["length"] <= max_gap_len
+        ):
+            mask.loc[curr_seg["start"]:curr_seg["end"]] = True
+
+    return mask
+
+
+def extract_idle_periods(mask):
+    groups = (mask != mask.shift()).cumsum()
+    idle_groups = mask[mask].groupby(groups[mask])
+    return [(group.index[0], group.index[-1]) for _, group in idle_groups]
+
+
+
+
+
+def analyze_subject_exercises(subject, merged_df):
+    subject_df = merged_df[merged_df['subject'] == subject]
+    exercises = ['e1', 'e2', 'e3', 'e4', 'e5', 'e6', 'e7', 'e8']
+
+    all_subject_ex = {}
+
+    for exercise in exercises:
+        subject_ex = subject_df[subject_df['exercise'] == exercise].copy()
+
+        if subject_ex.empty:
+            print(f"No data for {exercise}")
+            continue
+
+        unit_activity = {}
+
+        # Compute magnitudes for all units
+        for u in range(1, 6):
+            subject_ex[f"acc_mag_u{u}"] = np.sqrt(
+                subject_ex[f"acc_x_u{u}"]**2 +
+                subject_ex[f"acc_y_u{u}"]**2 +
+                subject_ex[f"acc_z_u{u}"]**2
+            )
+
+            subject_ex[f"gyr_mag_u{u}"] = np.sqrt(
+                subject_ex[f"gyr_x_u{u}"]**2 +
+                subject_ex[f"gyr_y_u{u}"]**2 +
+                subject_ex[f"gyr_z_u{u}"]**2
+            )
+
+            subject_ex[f"mag_mag_u{u}"] = np.sqrt(
+                subject_ex[f"mag_x_u{u}"]**2 +
+                subject_ex[f"mag_y_u{u}"]**2 +
+                subject_ex[f"mag_z_u{u}"]**2
+            )
+
+            total_std = (
+                subject_ex[f"acc_mag_u{u}"].std() +
+                subject_ex[f"gyr_mag_u{u}"].std() +
+                subject_ex[f"mag_mag_u{u}"].std()
+            )
+            unit_activity[f"u{u}"] = total_std
+
+        # Determine most active unit AFTER all units are processed
+        most_active_unit = max(unit_activity, key=unit_activity.get)
+
+        print(f"\n{exercise} — most active unit: {most_active_unit}")
+        print({k: round(v, 4) for k, v in unit_activity.items()})
+
+        # Add the column to the dataframe
+        subject_ex["most_active_unit"] = most_active_unit
+
+        # Save dataframe
+        all_subject_ex[exercise] = subject_ex
+
+        threshold = 0.1
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig.suptitle(f"Subject {subject} - {exercise}")
+
+        sensor_info = [
+            ("acc", "Acceleration magnitude", axes[0]),
+            ("gyr", "Gyroscope magnitude", axes[1]),
+            ("mag", "Magnetometer magnitude", axes[2]),
+        ]
+
+        anything_plotted = False
+
+        for sensor_prefix, title, ax in sensor_info:
+            plotted_here = False
+
+            for u in range(1, 6):
+                std = subject_ex[f"{sensor_prefix}_mag_u{u}"].std()
+
+                if std > threshold:
+                    ax.plot(
+                        subject_ex["time index"],
+                        subject_ex[f"{sensor_prefix}_mag_u{u}"],
+                        label=f"u{u} (std={std:.2f})"
+                    )
+                    plotted_here = True
+                    anything_plotted = True
+
+            ax.set_title(title)
+            ax.set_xlabel("time index")
+            ax.grid(True)
+
+            if sensor_prefix == "acc":
+                ax.set_ylabel("magnitude")
+
+            if plotted_here:
+                ax.legend()
+            else:
+                ax.text(
+                    0.5, 0.5, "No signal above threshold",
+                    transform=ax.transAxes,
+                    ha="center", va="center"
+                )
+
+        if anything_plotted:
+            plt.tight_layout(rect=[0, 0, 1, 0.95])
+            plt.show()
+        else:
+            plt.close()
+            print(f"No sensor exceeded threshold for {exercise}")
+
+    return all_subject_ex
+
+
+def find_idle_periods_adaptive(
+    df,
+    window_size=100,
+    smooth_window=50,
+    q_low=0.10,
+    q_high=0.60,
+    alpha=0.20,
+    min_idle_len=100,
+    max_gap_len=200,
+    plot=True
+):
+    """
+    Detect 2 idle periods using the most active unit, with combined energy from
+    acc + gyr + mag, and an adaptive threshold.
+
+    threshold = q_low_value + alpha * (q_high_value - q_low_value)
+    """
+
+    unit = df["most_active_unit"].iloc[0]
+
+    acc_col = f"acc_mag_{unit}"
+    gyr_col = f"gyr_mag_{unit}"
+    mag_col = f"mag_mag_{unit}"
+
+    required_cols = [acc_col, gyr_col, mag_col]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+
+    # Rolling local energy per modality
+    acc_energy = pd.Series(df[acc_col].to_numpy()).rolling(window_size, center=True).std()
+    gyr_energy = pd.Series(df[gyr_col].to_numpy()).rolling(window_size, center=True).std()
+    mag_energy = pd.Series(df[mag_col].to_numpy()).rolling(window_size, center=True).std()
+
+    # Combined energy
+    energy = acc_energy + gyr_energy + mag_energy
+    energy = energy.bfill().ffill()
+
+    # Smooth
+    energy_smooth = energy.rolling(smooth_window, center=True).median().bfill().ffill()
+
+    # Adaptive threshold
+    low_val = energy_smooth.quantile(q_low)
+    high_val = energy_smooth.quantile(q_high)
+    threshold = low_val + alpha * (high_val - low_val)
+
+    # Raw idle mask
+    idle_mask = energy_smooth < threshold
+
+    # Clean mask
+    idle_mask = remove_short_true_segments(idle_mask, min_len=min_idle_len)
+    idle_mask = fill_short_false_gaps(idle_mask, max_gap_len=max_gap_len)
+    idle_mask = remove_short_true_segments(idle_mask, min_len=min_idle_len)
+
+    # Extract intervals
+    idle_periods = extract_idle_periods(idle_mask)
+
+    # Keep 2 longest
+    idle_periods = sorted(idle_periods, key=lambda x: x[1] - x[0], reverse=True)[:2]
+    idle_periods = sorted(idle_periods, key=lambda x: x[0])
+
+    result = {
+        "most_active_unit": unit,
+        "threshold": threshold,
+        "low_val": low_val,
+        "high_val": high_val,
+        "energy_smooth": energy_smooth,
+        "idle_mask": idle_mask,
+        "idle_periods": idle_periods,
+        "columns_used": {
+            "acc": acc_col,
+            "gyr": gyr_col,
+            "mag": mag_col
+        }
+    }
+
+    if plot:
+        plt.figure(figsize=(12, 4))
+        plt.plot(energy_smooth, label="combined smoothed energy")
+        plt.axhline(threshold, linestyle="--", label=f"threshold={threshold:.3f}")
+
+        for start, end in idle_periods:
+            plt.axvspan(start, end, alpha=0.2)
+
+        plt.xlabel("time_step")
+        plt.ylabel("energy")
+        plt.title(f"Combined energy from {acc_col}, {gyr_col}, {mag_col}")
+        plt.grid(True)
+        plt.legend()
+        plt.show()
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(idle_mask.astype(int))
+        plt.xlabel("time_step")
+        plt.ylabel("idle")
+        plt.title(f"Idle mask using most active unit {unit}")
+        plt.grid(True)
+        plt.show()
+
+    return result
