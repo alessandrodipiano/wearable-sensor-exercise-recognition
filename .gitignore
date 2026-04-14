@@ -11,4 +11,7 @@ __pycache__/
 .DS_Store
 
 # VS Code
-.vscode/data/processed_data.csv
+.vscode/
+
+#data
+data/processed_data.csv
