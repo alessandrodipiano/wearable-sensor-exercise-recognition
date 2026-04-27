@@ -8,6 +8,7 @@ from email import encoders
 from datetime import datetime
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -28,6 +29,9 @@ from utilities.src import (
 # --------------------------------------------------
 
 DATA_PATH = "data/processed_data.csv"
+MODEL_PATH = "notebooks/models/xgb_repetition_quality.json"
+LE_PATH = "notebooks/models/label_encoder.pkl"
+FEAT_COLS_PATH = "notebooks/models/feature_columns.pkl"
 SIMULATION_SUBJECT = "s3"
 CLINICIAN_EMAIL = "stefanoanthony.rizzuto01@universitadipavia.it"
 ACTIVE_COLS = ["acc_mag_active", "gyr_mag_active"]
@@ -136,23 +140,10 @@ def build_dataset(df, n_reps=N_REPS_PER_BLOCK):
 
 @st.cache_resource
 def get_trained_model():
-    df = pd.read_csv(DATA_PATH)
-    dataset = build_dataset(df)
-
-    ds = pd.get_dummies(dataset.copy(), columns=["exercise"], prefix="ex")
-    le = LabelEncoder()
-    ds["label_enc"] = le.fit_transform(ds["label"])
-
-    feature_cols = [
-        c for c in ds.columns
-        if c not in ("label", "label_enc", "subject", "rep_id")
-    ]
-    X = ds[feature_cols]
-    y = ds["label_enc"]
-
-    model = XGBClassifier(**XGB_PARAMS)
-    model.fit(X, y)
-
+    model = XGBClassifier()
+    model.load_model(MODEL_PATH)
+    le = joblib.load(LE_PATH)
+    feature_cols = joblib.load(FEAT_COLS_PATH)
     return model, le, feature_cols
 
 
@@ -311,9 +302,7 @@ def load_data():
 st.set_page_config(page_title="Physical Therapy Exercise Tracker", layout="centered")
 st.title("Physical Therapy Exercise Tracker")
 
-# Train model once; show spinner only on first load
-with st.spinner("Initialising model (first run only)…"):
-    model, le, feature_cols = get_trained_model()
+model, le, feature_cols = get_trained_model()
 
 df = load_data()
 
