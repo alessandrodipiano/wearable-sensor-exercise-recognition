@@ -151,50 +151,120 @@ def get_trained_model():
 # Repetition auto-detection
 # --------------------------------------------------
 
-def detect_repetitions(exercise_df):
-    """
-    Detect active exercise blocks via combined energy thresholding, then split
-    each block into N_REPS_PER_BLOCK equal windows — matching the training pipeline.
+# Tunable constants for the falling-edge detector
+ENERGY_WINDOW     = 50   # rolling std window (timesteps) for energy computation
+SMOOTH_WINDOW     = 30   # median smoothing window (timesteps)
+MIN_REP_LEN       = 30   # minimum timesteps for a valid rep (~1.2 s at 25 Hz)
+MAX_REP_LEN       = 500  # maximum timesteps before forcing a rep close (~20 s)
+MIN_IDLE_LEN      = 10   # minimum consecutive idle timesteps to confirm falling edge
 
-    Returns (repetitions: list[DataFrame], n_blocks: int).
-    """
-    df = exercise_df.reset_index(drop=True)
-    unit = df["most_active_unit"].iloc[0]
 
+def _compute_energy(df, unit, energy_window=ENERGY_WINDOW, smooth_window=SMOOTH_WINDOW):
+    """Compute smoothed combined energy from the most active unit's acc + gyr magnitude."""
     acc_s = pd.Series(df[f"acc_mag_{unit}"].values)
     gyr_s = pd.Series(df[f"gyr_mag_{unit}"].values)
 
     energy = (
-        acc_s.rolling(50, center=True).std() +
-        gyr_s.rolling(50, center=True).std()
+        acc_s.rolling(energy_window, center=True).std() +
+        gyr_s.rolling(energy_window, center=True).std()
     ).bfill().ffill()
-    energy_smooth = energy.rolling(30, center=True).median().bfill().ffill()
 
-    low_val = energy_smooth.quantile(0.05)
-    high_val = energy_smooth.quantile(0.60)
-    threshold = low_val + 0.25 * (high_val - low_val)
+    energy_smooth = energy.rolling(smooth_window, center=True).median().bfill().ffill()
+    return energy_smooth
 
-    idle_mask = pd.Series(energy_smooth.values < threshold)
-    idle_mask = remove_short_true_segments(idle_mask, min_len=50)
-    idle_mask = fill_short_false_gaps(idle_mask, max_gap_len=100)
-    idle_mask = remove_short_true_segments(idle_mask, min_len=50)
 
-    active_mask = pd.Series(~idle_mask.values)
-    active_mask = remove_short_true_segments(active_mask, min_len=150)
+def _compute_threshold(energy_smooth, local_window=200):
+    """
+    Local adaptive threshold — recomputed over a rolling window of timesteps.
 
-    block_periods = extract_idle_periods(active_mask)
+    A single global threshold fails for fast reps because their inter-rep
+    rests sit above the global idle level. By computing the threshold locally,
+    it rises to match the elevated baseline of the fast block, making the
+    brief dips between fast reps visible relative to their local context.
 
-    repetitions = []
-    for start, end in block_periods:
-        block = df.iloc[start:end + 1].reset_index(drop=True)
-        n = len(block)
-        cuts = np.linspace(0, n, N_REPS_PER_BLOCK + 1, dtype=int)
-        for i in range(N_REPS_PER_BLOCK):
-            rep = block.iloc[cuts[i]:cuts[i + 1]].reset_index(drop=True)
-            if len(rep) > 0:
-                repetitions.append(rep)
+    Returns a Series of per-timestep threshold values (same index as energy_smooth).
+    """
+    local_low  = (energy_smooth
+                  .rolling(local_window, center=True, min_periods=1)
+                  .quantile(0.05)
+                  .bfill().ffill())
+    local_high = (energy_smooth
+                  .rolling(local_window, center=True, min_periods=1)
+                  .quantile(0.60)
+                  .bfill().ffill())
+    return local_low + 0.25 * (local_high - local_low)
 
-    return repetitions, len(block_periods)
+
+def detect_repetitions(exercise_df):
+    """
+    Detect individual repetitions via a falling-edge state machine.
+
+    The detector streams through the energy signal timestep by timestep,
+    toggling between IDLE and ACTIVE states:
+      - IDLE  → ACTIVE : energy rises above threshold
+      - ACTIVE → IDLE  : energy falls below threshold for MIN_IDLE_LEN consecutive
+                         timesteps AND the active buffer is long enough to be a rep
+
+    This makes no assumption about how many reps the patient performs —
+    each rep is detected and closed independently as it ends.
+
+    Returns (repetitions: list[DataFrame], n_reps_detected: int).
+    """
+    df   = exercise_df.reset_index(drop=True)
+    unit = df["most_active_unit"].iloc[0]
+
+    energy_smooth  = _compute_energy(df, unit)
+    threshold_s    = _compute_threshold(energy_smooth)   # Series, one value per timestep
+    energy_vals    = energy_smooth.values
+    threshold_vals = threshold_s.values
+
+    # ── State machine ────────────────────────────────────────────────────────
+    state        = "IDLE"
+    buffer_start = None   # index where current active period began
+    idle_streak  = 0      # consecutive below-threshold timesteps while ACTIVE
+    repetitions  = []
+
+    for t, e in enumerate(energy_vals):
+        thr = threshold_vals[t]   # local threshold at this timestep
+
+        if state == "IDLE":
+            if e >= thr:
+                # Rising edge — start a new rep buffer
+                state        = "ACTIVE"
+                buffer_start = t
+                idle_streak  = 0
+
+        else:  # state == "ACTIVE"
+            rep_len = t - buffer_start
+
+            if e < thr:
+                idle_streak += 1
+            else:
+                idle_streak = 0  # energy recovered — not the end of the rep yet
+
+            # Falling edge confirmed when idle long enough OR rep is suspiciously long
+            falling_edge  = (idle_streak >= MIN_IDLE_LEN)
+            forced_close  = (rep_len >= MAX_REP_LEN)
+
+            if falling_edge or forced_close:
+                # Close the rep at the point where energy first dropped
+                close_at = t - idle_streak if falling_edge else t
+                if (close_at - buffer_start) >= MIN_REP_LEN:
+                    rep = df.iloc[buffer_start:close_at].reset_index(drop=True)
+                    repetitions.append(rep)
+
+                # Transition back to IDLE
+                state        = "IDLE"
+                buffer_start = None
+                idle_streak  = 0
+
+    # Handle a rep that was still open when the signal ended
+    if state == "ACTIVE" and buffer_start is not None:
+        tail = df.iloc[buffer_start:].reset_index(drop=True)
+        if len(tail) >= MIN_REP_LEN:
+            repetitions.append(tail)
+
+    return repetitions, len(repetitions)
 
 
 # --------------------------------------------------
@@ -351,8 +421,7 @@ if start_tracking:
         st.stop()
 
     st.success(
-        f"Auto-detected **{n_blocks} exercise block(s)** — "
-        f"**{len(repetitions)} repetitions** to classify."
+        f"Auto-detected **{len(repetitions)} repetition(s)** in the recording."
     )
 
     # --------------------------------------------------
