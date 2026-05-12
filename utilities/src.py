@@ -1,5 +1,10 @@
 import pandas as pd 
 
+
+exercises = ['e1','e2','e3','e4','e5','e6','e7','e8',]
+subjects=['s1', 's2', 's3', 's4', 's5',]
+labels=['correct', 'fast', 'low_amplitude']
+
 def build_df(root):
 
     templates = []

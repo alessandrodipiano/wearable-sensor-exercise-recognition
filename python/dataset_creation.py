@@ -15,10 +15,10 @@ import torch
 import numpy as np
 import pandas as pd
 
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+DATA_DIR = PROJECT_ROOT / "data"
 
-BASE_DIR = Path().resolve()
-PROJECT_ROOT = BASE_DIR.parent   #to go un up the the root
-DATA_DIR = PROJECT_ROOT / "data" 
 
 
 
@@ -72,6 +72,8 @@ inputs_global = [
     'limb',
     'exercise_e1', 'exercise_e2', 'exercise_e3', 'exercise_e4',
     'exercise_e5', 'exercise_e6', 'exercise_e7', 'exercise_e8'
+
+
 ]
 
 
