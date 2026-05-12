@@ -99,3 +99,54 @@ class CNNMLPModel(nn.Module):
         # Final output
         out = self.classifier(h)                # (B, num_classes)
         return out
+
+
+
+class CNNMLPModelSmall(nn.Module):
+    def __init__(self, input_dim_seq, input_dim_global, num_classes):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv1d(input_dim_seq, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(0.4),
+
+            nn.Conv1d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool1d(1)
+        )
+
+        self.global_mlp = nn.Sequential(
+            nn.Linear(input_dim_global, 32),
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            nn.Dropout(0.4),
+
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(64 + 16, 32),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(32, num_classes)
+        )
+
+    def forward(self, x_seq, x_global):
+        h_seq = self.features(x_seq)
+        h_seq = torch.flatten(h_seq, start_dim=1)
+
+        h_global = self.global_mlp(x_global)
+
+        h = torch.cat([h_seq, h_global], dim=1)
+        return self.classifier(h)

@@ -1,25 +1,20 @@
-import sys 
+import sys
 from pathlib import Path
-sys.path.append(str(Path().resolve().parent))
-
-import torch.nn.functional as F
-
-
-
-
-
-
-
-from utilities.model import CNNmodel_base, CNNMLPModel
-import torch
-import numpy as np
-import pandas as pd
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 DATA_DIR = PROJECT_ROOT / "data"
 
+sys.path.append(str(PROJECT_ROOT))
 
+import torch
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+
+from utilities.src import subjects, exercises, labels, detect_peaks_and_valleys_clean
+
+##########################################################àà
 
 
 df=pd.read_csv(DATA_DIR / 'processed_data.csv')
@@ -41,23 +36,84 @@ df['limb'] = df['limb'].astype(np.float32)
 exercise_dummies = pd.get_dummies(df['exercise'], prefix='exercise').astype(np.float32)
 df = pd.concat([df, exercise_dummies], axis=1)
 
-exercises = ['e1','e2','e3','e4','e5','e6','e7','e8']
-subject=['s1', 's2', 's3','s4', 's5']
-labels=['correct', 'low_amplitude', 'fast']
+#####################################################
 
-for s in  subject:
+import numpy as np
+valleys_indexes={}
+for s in subjects:
     for e in exercises:
         for l in labels:
 
+            used = df[
+                (df['subject'] == s) &
+                (df['exercise'] == e) &
+                (df['label'] == l)
+            ]
 
-            df_r=df[(df['subject'] == s) & (df['exercise'] == e) & (df['label']==l)]
+            u = used['most_active_unit'].iloc[0]
+            time = used["time index"].to_numpy()
 
+            peaks, valleys, info = detect_peaks_and_valleys_clean(
+                                                used=used,
+                                                u=u,
+                                                expected_reps=10,
+                                                max_valleys=11,
+                                                peak_prominence=0.5,
+                                                valley_prominence=0.05,
+                                                plot=False
+                                            )
             
-            duration = df_r['time index'].max() - df_r['time index'].min()
+            key=f'{s}-{e}-{l}'
 
-            repetition_duration= duration /10
+            valleys_indexes[key] = time[valleys]
 
-            #print(repetition_duration, duration, l)
+            print(
+                f"subject={s}, exercise={e}, label={l}, "
+                f"unit={u}, axis={info['axis']}, valleys={info['n_valleys']}"
+            )
+
+valleys_indexes["s2-e1-correct"] = np.insert(valleys_indexes["s2-e1-correct"], 0, 1)
+valleys_indexes["s3-e1-correct"] = np.insert(valleys_indexes["s3-e1-correct"], 0, 1)
+
+df["rep"] = np.nan
+
+for key, boundaries in valleys_indexes.items():
+    s, e, label = key.split("-")
+
+    boundaries = np.asarray(boundaries, dtype=int)
+    boundaries = np.sort(boundaries)
+
+    base_mask = (
+        (df["subject"] == s) &
+        (df["exercise"] == e) &
+        (df["label"] == label)
+    )
+
+    if base_mask.sum() == 0:
+        continue
+
+    for rep_id, (start, end) in enumerate(
+        zip(boundaries[:-1], boundaries[1:]),
+        start=1
+    ):
+        if rep_id > 10:
+            break
+
+        rep_mask = (
+            base_mask &
+            (df["time index"] >= start) &
+            (df["time index"] < end)
+        )
+
+        df.loc[rep_mask, "rep"] = rep_id
+
+
+df = df.dropna(subset=["rep"]).copy()
+
+
+
+
+
 
 
 inputs_seq = [
@@ -83,39 +139,54 @@ label_to_idx = {
     'fast': 2
 }
 
+
+
 all_sequences = []
 all_labels = []
-all_subjects = []   
-all_exercises = []  
-all_global_features=[]
+all_subjects = []
+all_exercises = []
+all_global_features = []
+all_rep_ids = []
 
-
-for s in subject:
+for s in subjects:   
     for e in exercises:
         for l in labels:
 
-            df_r = df[
-                (df['subject'] == s) &
-                (df['exercise'] == e) &
-                (df['label'] == l)
+            df_trial = df[
+                (df["subject"] == s) &
+                (df["exercise"] == e) &
+                (df["label"] == l)
             ].copy()
 
-            df_r = df_r.sort_values('time index')
+            if df_trial.empty:
+                continue
 
-            duration = df_r['time index'].max() - df_r['time index'].min()
-            rep_len = int(duration / 10)
+            df_trial = df_trial.sort_values("time index")
 
-            for i in range(10):
-                rep = df_r.iloc[i * rep_len:(i + 1) * rep_len]
+            
+            for rep_id in range(1, 11):
 
-                X_rep = rep[inputs_seq].to_numpy()              # (time, seq_features)
-                g_rep = torch.tensor(rep[inputs_global].iloc[0].to_numpy(), dtype=torch.float32)  # (global_features,)
+                rep = df_trial[df_trial["rep"] == rep_id].copy()
+
+                
+                if rep.empty:
+                    continue
+
+                rep = rep.sort_values("time index")
+
+                X_rep = rep[inputs_seq].to_numpy()   # (time, seq_features)
+
+                g_rep = torch.tensor(
+                    rep[inputs_global].iloc[0].to_numpy(),
+                    dtype=torch.float32
+                )
 
                 all_sequences.append(X_rep)
                 all_global_features.append(g_rep)
                 all_labels.append(label_to_idx[l])
                 all_subjects.append(s)
                 all_exercises.append(e)
+                all_rep_ids.append(rep_id)
 
 max_len = max(seq.shape[0] for seq in all_sequences)
 
@@ -126,15 +197,22 @@ for seq in all_sequences:
     seq = seq.transpose(0, 1)                     # (features, time)
 
     pad_len = max_len - seq.shape[1]
-    seq = F.pad(seq, (0, pad_len))
+    seq = F.pad(seq, (0, pad_len))                # pad time dimension
 
     padded.append(seq)
 
-X_seq = torch.stack(padded)  # (N, features, max_len)
-X_glob=torch.stack(all_global_features)
+X_seq = torch.stack(padded)        # (N, features, max_len)
+X_glob = torch.stack(all_global_features)
 y = torch.tensor(all_labels, dtype=torch.long)
 
 all_subjects = np.array(all_subjects)
+all_exercises = np.array(all_exercises)
+all_rep_ids = np.array(all_rep_ids)
+
 unique_subjects = np.unique(all_subjects)
+
+
+            
+
 
 
