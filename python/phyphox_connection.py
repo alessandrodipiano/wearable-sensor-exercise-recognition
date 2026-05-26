@@ -3,7 +3,7 @@ import time
 
 
 # Copy this from the phyphox app after enabling Remote access
-BASE_URL = "http://192.168.1.11:8080"
+BASE_URL = #put here your brit, you find it on phyphox
 
 # Change these depending on the experiment
 SENSOR_CHANNELS = (
