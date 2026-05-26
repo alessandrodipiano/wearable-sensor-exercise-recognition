@@ -168,15 +168,22 @@ df = df.dropna(subset=["rep"]).copy()
 
 
 
+inputs_seq=['acc_x_u1', 'acc_x_u2', 'acc_x_u3',
+       'acc_x_u4', 'acc_x_u5', 'acc_y_u1', 'acc_y_u2', 'acc_y_u3', 'acc_y_u4',
+       'acc_y_u5', 'acc_z_u1', 'acc_z_u2', 'acc_z_u3', 'acc_z_u4', 'acc_z_u5',
+       'gyr_x_u1', 'gyr_x_u2', 'gyr_x_u3', 'gyr_x_u4', 'gyr_x_u5', 'gyr_y_u1',
+       'gyr_y_u2', 'gyr_y_u3', 'gyr_y_u4', 'gyr_y_u5', 'gyr_z_u1', 'gyr_z_u2',
+       'gyr_z_u3', 'gyr_z_u4', 'gyr_z_u5', 'mag_x_u1', 'mag_x_u2', 'mag_x_u3',
+       'mag_x_u4', 'mag_x_u5', 'mag_y_u1', 'mag_y_u2', 'mag_y_u3', 'mag_y_u4',
+       'mag_y_u5', 'mag_z_u1', 'mag_z_u2', 'mag_z_u3', 'mag_z_u4', 'mag_z_u5',]
 
-
-inputs_seq = [
+'''inputs_seq = [
     'acc_mag_u1', 'gyr_mag_u1', 'mag_mag_u1',
     'acc_mag_u2', 'gyr_mag_u2', 'mag_mag_u2',
     'acc_mag_u3', 'gyr_mag_u3', 'mag_mag_u3',
     'acc_mag_u4', 'gyr_mag_u4', 'mag_mag_u4',
     'acc_mag_u5', 'gyr_mag_u5', 'mag_mag_u5'
-]
+]'''
 
 inputs_exercise = [
     "limb",
