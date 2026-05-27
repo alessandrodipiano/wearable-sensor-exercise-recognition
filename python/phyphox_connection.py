@@ -6,32 +6,72 @@ import time
 BASE_URL = 'http://192.168.1.11:8080'
 
 # Change these depending on the experiment
+
+PHYPHOX_CHANNELS = (
+    "accX", "accY", "accZ",
+    "gyroX", "gyroY", "gyroZ",
+    "magX", "magY", "magZ",
+)
+
+
 SENSOR_CHANNELS = (
     "accX", "accY", "accZ",
     "gyrX", "gyrY", "gyrZ",
     "magX", "magY", "magZ",
 )
+
+PHYPHOX_TO_INTERNAL = {
+    "accX": "accX",
+    "accY": "accY",
+    "accZ": "accZ",
+    "gyroX": "gyrX",
+    "gyroY": "gyrY",
+    "gyroZ": "gyrZ",
+    "magX": "magX",
+    "magY": "magY",
+    "magZ": "magZ",
+}
+
 DURATION = 30
 SAMPLE_INTERVAL = 0.1
+
+def test_connection(url=None, timeout=3):
+    """
+    Probe the phyphox device with a read-only GET /config request.
+
+    Returns (ok: bool, latency_ms: float | None, error: str | None).
+    Uses BASE_URL if url is not supplied.
+    """
+    import time as _time
+    target = (url or BASE_URL).rstrip("/")
+    try:
+        t0 = _time.perf_counter()
+        r = requests.get(f"{target}/config", timeout=timeout)
+        r.raise_for_status()
+        return True, round((_time.perf_counter() - t0) * 1000, 1), None
+    except Exception as exc:  # noqa: BLE001
+        return False, None, str(exc)
+
 
 def send_command(command):
     response = requests.get(f"{BASE_URL}/control?cmd={command}", timeout=5)
     response.raise_for_status()
 
 def read_values():
-    query = "&".join(SENSOR_CHANNELS)
+    query = "&".join(PHYPHOX_CHANNELS)
     response = requests.get(f"{BASE_URL}/get?{query}", timeout=5)
     response.raise_for_status()
     data = response.json()
 
     row = {"computer_time": time.time()}
 
-    for channel in SENSOR_CHANNELS:
-        buffer = data["buffer"][channel]["buffer"]
-        row[channel] = buffer[0] if buffer else None
+    for phyphox_channel in PHYPHOX_CHANNELS:
+        internal_channel = PHYPHOX_TO_INTERNAL[phyphox_channel]
+
+        buffer = data["buffer"][phyphox_channel]["buffer"]
+        row[internal_channel] = buffer[-1] if buffer else None
 
     return row
-
 
 
 
@@ -236,7 +276,7 @@ def detect_peaks_and_valleys_clean(
     }
 
     if plot:
-        plt.figure(figsize=(12, 4))
+        fig = plt.figure(figsize=(12, 4))
 
         plt.plot(
             time,
@@ -267,7 +307,11 @@ def detect_peaks_and_valleys_clean(
         plt.xlabel("computer_time")
         plt.ylabel("normalized signal")
         plt.legend()
-        plt.show()
+        # Do not call plt.show() — callers decide how to render the figure
+        # (Streamlit uses st.pyplot(fig); terminal callers call plt.show()).
+        info["fig"] = fig
+    else:
+        info["fig"] = None
 
     return peaks, valleys, info
 
