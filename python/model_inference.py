@@ -18,10 +18,10 @@ from python.rep_detection import repetitions, original_lengths
 # User inputs
 # ============================================================
 
-gender = 1      # 0 = female, 1 = male
-age = 23
-weight = 85     # kg
-height = 185    # cm
+gender = 0      # 0 = female, 1 = male
+age = 22
+weight = 60     # kg
+height = 175    # cm
 
 exercise = "e7"   # user input
 

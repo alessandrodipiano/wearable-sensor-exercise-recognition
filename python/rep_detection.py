@@ -92,11 +92,11 @@ df = pd.DataFrame(rows)
 df=df.dropna()
 peaks, valleys, info = detect_peaks_and_valleys_clean(
     used=df,
-    expected_reps=10,
-    max_valleys=11,
+    expected_reps=17,
+    max_valleys=18,
     window_length=51,
     polyorder=3,
-    peak_prominence=0.5,
+    peak_prominence=1,
     valley_prominence=0,
     plot=True
 )
