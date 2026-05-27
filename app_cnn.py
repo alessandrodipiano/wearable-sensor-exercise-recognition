@@ -185,20 +185,14 @@ if "profile" not in st.session_state:
 
         c5, c6 = st.columns(2)
         with c5:
-            weight = st.number_input("Weight (kg)", min_value=1.0, max_value=300.0, value=60.0, step=0.5)
+            weight = st.number_input("Weight (kg)", min_value=1, max_value=300, value=60, step=1)
         with c6:
-            height = st.number_input("Height (cm)", min_value=30.0, max_value=250.0, value=175.0, step=0.5)
+            height = st.number_input("Height (cm)", min_value=30, max_value=250, value=175, step=1)
 
         exercise = st.selectbox(
             "Exercise",
             options=EXERCISES_ORDER,
             format_func=exercise_label,
-        )
-
-        phyphox_url = st.text_input(
-            "phyphox URL",
-            value=phyphox_connection.BASE_URL,
-            help="From the phyphox app: enable 'Allow remote access' and copy the shown address.",
         )
 
         submitted = st.form_submit_button("Save profile", type="primary")
@@ -214,10 +208,11 @@ if "profile" not in st.session_state:
             "gender_label": gender_label,
             "gender": 1 if gender_label == "Male" else 0,
             "age": int(age),
-            "weight": float(weight),
-            "height": float(height),
+            "weight": int(weight),
+            "height": int(height),
             "exercise": exercise,
-            "phyphox_url": phyphox_url.strip(),
+            # URL is set separately in Step 2 so it can be changed without re-entering the profile
+            "phyphox_url": st.session_state.get("phyphox_url", phyphox_connection.BASE_URL),
         }
         st.rerun()
 
@@ -243,6 +238,17 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+phyphox_url = st.text_input(
+    "phyphox URL",
+    value=st.session_state.get("phyphox_url", profile["phyphox_url"]),
+    help="From the phyphox app: enable 'Allow remote access' and copy the shown address.",
+    key="phyphox_url_input",
+)
+# Keep the URL in session state so it survives reruns and profile edits
+if phyphox_url.strip():
+    st.session_state["phyphox_url"] = phyphox_url.strip()
+    profile["phyphox_url"] = phyphox_url.strip()
 
 col_a, col_b, col_c = st.columns([2, 1, 1])
 with col_a:
