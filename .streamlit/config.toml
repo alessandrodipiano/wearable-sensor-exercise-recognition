@@ -1,6 +1,13 @@
 [theme]
+<<<<<<< HEAD
 primaryColor = "#2563EB"
 backgroundColor = "#F8FAFB"
 secondaryBackgroundColor = "#FFFFFF"
 textColor = "#1E293B"
+=======
+primaryColor = "#2D8A6B"
+backgroundColor = "#F5F9F7"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#2C3E50"
+>>>>>>> 09952647504d5f0ab85b9442594071faf7c76800
 font = "sans serif"
