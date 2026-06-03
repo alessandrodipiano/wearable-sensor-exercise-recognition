@@ -43,11 +43,7 @@ class CNNMLPModel0(nn.Module):
             nn.BatchNorm1d(64),
             nn.ReLU(),
 
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.Conv1d(128, 128, kernel_size=3, padding=1),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
 
@@ -144,19 +140,13 @@ class CNNMLPModel(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(),
 
-            nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.3),
-
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
 
             nn.AdaptiveAvgPool1d(1)
         )
 
             
 
-            self.seq_out_dim = 256
+            self.seq_out_dim = 128
             fusion_dim += self.seq_out_dim
 
         if self.use_ex:
