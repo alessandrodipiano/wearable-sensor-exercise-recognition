@@ -138,7 +138,7 @@ def build_model(device=None):
     ).to(device)
 
     fold_results = torch.load(
-        PROJECT_ROOT / "notebooks" / "CNN" / "fold_results.pth",
+        PROJECT_ROOT / "fold_results.pth",
         map_location=device,
         weights_only=False,
     )
