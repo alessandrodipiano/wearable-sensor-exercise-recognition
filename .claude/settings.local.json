@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(.venv/Scripts/python.exe -m py_compile app.py)",
-      "Bash(.venv/Scripts/python.exe -m py_compile app_cnn.py)"
-    ]
-  }
-}
