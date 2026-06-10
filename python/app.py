@@ -14,8 +14,8 @@ import streamlit as st
 import torch
 import torch.nn.functional as F
 from scipy.signal import find_peaks, savgol_filter
-
-sys.path.insert(0, str(Path(__file__).parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 from utilities.model import CNNMLPModel
 from utilities.src import (
     remove_short_true_segments,
