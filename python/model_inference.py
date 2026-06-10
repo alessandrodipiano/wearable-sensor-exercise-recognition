@@ -5,25 +5,11 @@ import torch
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-print(PROJECT_ROOT)
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from utilities.model import CNNMLPModel
-from python.rep_detection import repetitions, original_lengths
-
-
-# ============================================================
-# User inputs
-# ============================================================
-
-gender = 0      # 0 = female, 1 = male
-age = 22
-weight = 60     # kg
-height = 175    # cm
-
-exercise = "e7"   # user input
 
 
 # ============================================================
@@ -126,119 +112,132 @@ def expand_single_unit_to_45(X_seq_9, unit="u2"):
 
 
 # ============================================================
-# Build tensors
+# Model loading
 # ============================================================
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# repetitions comes from rep_detection
-# expected original shape: (N, 128, 9)
-repetitions = torch.tensor(repetitions, dtype=torch.float32)
-
-# Convert to Conv1d format: (N, 128, 9) -> (N, 9, 128)
-X_seq_val = repetitions.transpose(1, 2)
-
-# Expand from one live unit to 45 training channels
-# Choose the unit that represents where the phone/live sensor is worn.
-X_seq_val = expand_single_unit_to_45(X_seq_val, unit="u2")
+IDX_TO_LABEL = {
+    0: "correct",
+    1: "low_amplitude",
+    2: "fast",
+}
 
 
-# Build X_info_val: (N, 5)
-# Components: [gender, age, weight, height, original_len]
-X_info_rows = []
+def build_model(device=None):
+    """Load the trained CNN+MLP model and return (model, device)."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-for original_len in original_lengths:
-    x_info = np.array(
-        [gender, age, weight, height, original_len],
-        dtype=np.float32
+    model = CNNMLPModel(
+        input_dim_seq=45,
+        input_dim_exercise=9,
+        input_dim_info=5,
+        num_classes=3,
+        use_seq=True,
+        use_ex=True,
+        use_info=True,
+    ).to(device)
+
+    fold_results = torch.load(
+        PROJECT_ROOT / "fold_results.pth",
+        map_location=device,
+        weights_only=False,
     )
-    X_info_rows.append(x_info)
+    model.load_state_dict(fold_results["s2"]["model_state_dict"])
+    model.eval()
 
-X_info_val = torch.tensor(
-    np.stack(X_info_rows),
-    dtype=torch.float32
-)
-
-
-# Build X_ex_val: (N, 9)
-exercise_dummy = make_exercise_dummy(exercise)
-exercise_dummy = torch.tensor(exercise_dummy, dtype=torch.float32)
-
-n_reps = X_seq_val.shape[0]
-X_ex_val = exercise_dummy.unsqueeze(0).repeat(n_reps, 1)
-
-
-# Sanity checks
-print("X_seq_val:", X_seq_val.shape)
-print("X_ex_val:", X_ex_val.shape)
-print("X_info_val:", X_info_val.shape)
-
-assert X_seq_val.shape[0] == X_ex_val.shape[0] == X_info_val.shape[0]
-assert X_seq_val.shape[1] == 45
-assert X_ex_val.shape[1] == 9
-assert X_info_val.shape[1] == 5
-
-
-# ============================================================
-# Load model
-# ============================================================
-
-model = CNNMLPModel(
-    input_dim_seq=45,
-    input_dim_exercise=9,
-    input_dim_info=5,
-    num_classes=3,
-    use_seq=True,
-    use_ex=True,
-    use_info=True,
-).to(device)
-
-fold_results = torch.load(
-    PROJECT_ROOT / "notebooks" / "CNN" / "fold_results.pth",
-    map_location=device
-)
-
-checkpoint = fold_results["s2"]
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
+    return model, device
 
 
 # ============================================================
 # Inference
 # ============================================================
 
-X_seq_val = X_seq_val.to(device)
-X_ex_val = X_ex_val.to(device)
-X_info_val = X_info_val.to(device)
+def run_inference(
+    repetitions,
+    original_lengths,
+    gender,
+    age,
+    weight,
+    height,
+    exercise,
+    unit="u2",
+    model=None,
+    device=None,
+):
+    """
+    Run the trained model on a batch of detected repetitions.
 
-with torch.no_grad():
-    outputs = model(X_seq_val, X_ex_val, X_info_val)
+    Dynamic inputs (set by the app's form):
+        gender   : 0 = female, 1 = male
+        age      : years
+        weight   : kg
+        height   : cm
+        exercise : one of "e1".."e8"
 
-    probs = torch.softmax(outputs, dim=1)
-    preds = torch.argmax(probs, dim=1)
+    Sensor inputs (from rep_detection.record_repetitions):
+        repetitions      : array-like (N, 128, 9)
+        original_lengths : array-like (N,)
 
+    Returns (preds, probs) as numpy arrays.
+    """
+    if model is None:
+        model, device = build_model(device)
+    if device is None:
+        device = next(model.parameters()).device
 
-# ============================================================
-# Results
-# ============================================================
+    # (N, 128, 9) -> (N, 9, 128) -> (N, 45, 128)
+    X_seq = torch.as_tensor(np.asarray(repetitions), dtype=torch.float32)
+    X_seq = X_seq.transpose(1, 2)
+    X_seq = expand_single_unit_to_45(X_seq, unit=unit)
 
-idx_to_label = {
-    0: "correct",
-    1: "low_amplitude",
-    2: "fast",
-}
+    n_reps = X_seq.shape[0]
+    if n_reps == 0:
+        return np.empty(0, dtype=np.int64), np.empty((0, 3), dtype=np.float32)
 
-preds_np = preds.cpu().numpy()
-probs_np = probs.cpu().numpy()
-
-print("Predictions:", preds_np)
-
-for i, pred in enumerate(preds_np):
-    print(
-        f"Rep {i + 1}: "
-        f"{idx_to_label[pred]} | "
-        f"probabilities = {probs_np[i]}"
+    # X_info: (N, 5) = [gender, age, weight, height, original_len]
+    X_info = torch.tensor(
+        np.array(
+            [[gender, age, weight, height, ol] for ol in original_lengths],
+            dtype=np.float32,
+        ),
+        dtype=torch.float32,
     )
+
+    # X_ex: (N, 9) = limb + one-hot exercise, repeated per rep
+    exercise_dummy = torch.tensor(make_exercise_dummy(exercise), dtype=torch.float32)
+    X_ex = exercise_dummy.unsqueeze(0).repeat(n_reps, 1)
+
+    X_seq = X_seq.to(device)
+    X_ex = X_ex.to(device)
+    X_info = X_info.to(device)
+
+    with torch.no_grad():
+        outputs = model(X_seq, X_ex, X_info)
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+
+    return preds.cpu().numpy(), probs.cpu().numpy()
+
+
+if __name__ == "__main__":
+    # Standalone live run: record from the phone, then classify.
+    from python.rep_detection import record_repetitions
+
+    repetitions, original_lengths, _ = record_repetitions(plot=True)
+
+    preds_np, probs_np = run_inference(
+        repetitions,
+        original_lengths,
+        gender=0,
+        age=22,
+        weight=60,
+        height=175,
+        exercise="e7",
+    )
+
+    print("Predictions:", preds_np)
+    for i, pred in enumerate(preds_np):
+        print(f"Rep {i + 1}: {IDX_TO_LABEL[int(pred)]} | probabilities = {probs_np[i]}")
 
 
 

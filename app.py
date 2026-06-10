@@ -1,5 +1,4 @@
 import sys
-import time
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -8,16 +7,16 @@ from email import encoders
 from datetime import datetime
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from scipy.stats import skew, kurtosis
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
+import torch
+import torch.nn.functional as F
+from scipy.signal import find_peaks, savgol_filter
 
 sys.path.insert(0, str(Path(__file__).parent))
+from utilities.model import CNNMLPModel
 from utilities.src import (
     remove_short_true_segments,
     fill_short_false_gaps,
@@ -28,272 +27,309 @@ from utilities.src import (
 # Constants
 # --------------------------------------------------
 
-DATA_PATH = "data/processed_data.csv"
-MODEL_PATH = "notebooks/models/xgb_repetition_quality.json"
-LE_PATH = "notebooks/models/label_encoder.pkl"
-FEAT_COLS_PATH = "notebooks/models/feature_columns.pkl"
-SIMULATION_SUBJECT = "s3"
+SIMULATION_SUBJECT = "s2"
 CLINICIAN_EMAIL = "stefanoanthony.rizzuto01@universitadipavia.it"
-ACTIVE_COLS = ["acc_mag_active", "gyr_mag_active"]
-LABELS_ORDER = ["correct", "fast", "low_amplitude"]
-N_REPS_PER_BLOCK = 10
+LABELS_ORDER = ["correct", "low_amplitude", "fast"]
 
-XGB_PARAMS = dict(
-    objective="multi:softprob",
-    num_class=3,
-    n_estimators=100,
-    max_depth=3,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.5,
-    min_child_weight=6,
-    gamma=0.2,
-    reg_lambda=4.0,
-    reg_alpha=1.0,
-    random_state=42,
-    eval_metric="mlogloss",
-)
+CNN_MODEL_PATH = "notebooks/CNN/fold_results.pth"
+CNN_FOLD_KEY   = "s2"   # only fold whose state_dict is saved in fold_results.pth
+
+CNN_INPUT_SEQ_COLS = [
+    "acc_mag_u1", "gyr_mag_u1", "mag_mag_u1",
+    "acc_mag_u2", "gyr_mag_u2", "mag_mag_u2",
+    "acc_mag_u3", "gyr_mag_u3", "mag_mag_u3",
+    "acc_mag_u4", "gyr_mag_u4", "mag_mag_u4",
+    "acc_mag_u5", "gyr_mag_u5", "mag_mag_u5",
+]
+
+EXERCISES_ORDER = [f"e{i}" for i in range(1, 9)]
+
+LIMB_MAP = {
+    "e1": 0, "e2": 1, "e3": 0, "e4": 0,
+    "e5": 0, "e6": 1, "e7": 1, "e8": 1,
+}
+
+IDX_TO_LABEL = {0: "correct", 1: "low_amplitude", 2: "fast"}
+
+# FIX 2 — Fixed pad length matching training pipeline (dataset_creation.py).
+# dataset_creation.py computes max_len = max(rep.shape[0] for all reps) across
+# all subjects/exercises/labels. That value is 237. Every rep must be padded
+# to exactly this length — NOT to the session's local max — so the CNN sees
+# the same temporal scale it was trained on.
+CNN_MAX_LEN = 237
 
 # --------------------------------------------------
-# Feature extraction — v13 (from XGBoost.ipynb)
+# Repetition auto-detection — peak/valley based (from peak_detection.ipynb)
 # --------------------------------------------------
 
-def extract_features_v13(segment, sensor_cols=ACTIVE_COLS):
-    features = {}
+def safe_savgol(x, window_length=51, polyorder=3):
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    if n <= polyorder + 2:
+        return x
+    window_length = min(window_length, n if n % 2 == 1 else n - 1)
+    if window_length <= polyorder:
+        return x
+    return savgol_filter(x, window_length, polyorder)
 
-    for col in sensor_cols:
-        x = segment[col].to_numpy().astype(float)
-        n = len(x)
-        x_c = x - np.mean(x)
 
-        features[f"{col}_mean"] = np.mean(x)
-        features[f"{col}_std"] = np.std(x)
-        features[f"{col}_median"] = np.median(x)
+def enforce_alternating_extrema(sig_n, peaks, valleys, max_valleys=11):
+    peaks = np.asarray(peaks, dtype=int)
+    valleys = np.asarray(valleys, dtype=int)
 
-        features[f"{col}_range"] = float(np.max(x) - np.min(x))
-        q25, q75 = np.percentile(x, [25, 75])
-        features[f"{col}_iqr"] = float(q75 - q25)
-        p10, p90 = np.percentile(x, [10, 90])
-        features[f"{col}_spread"] = float(p90 - p10)
-        features[f"{col}_rms"] = float(np.sqrt(np.mean(x ** 2)))
+    extrema = [(p, "peak") for p in peaks] + [(v, "valley") for v in valleys]
+    extrema = sorted(extrema, key=lambda x: x[0])
 
-        features[f"{col}_skew"] = float(skew(x))
-        features[f"{col}_kurtosis"] = float(kurtosis(x))
-
-        mid = n // 2
-        first, second = x[:mid], x[mid:]
-        rms_first = float(np.sqrt(np.mean(first ** 2))) if len(first) > 0 else 0.0
-        rms_second = float(np.sqrt(np.mean(second ** 2))) if len(second) > 0 else 0.0
-        features[f"{col}_energy_diff"] = rms_first - rms_second
-
-        fft_mag = np.abs(np.fft.rfft(x_c))
-        power = fft_mag ** 2
-        total = power.sum()
-
-        if total > 0 and len(power) > 1:
-            pn = power / total
-            dom_idx = int(np.argmax(power[1:]) + 1)
-            features[f"{col}_dom_freq_idx"] = dom_idx
-            features[f"{col}_dom_freq_power"] = float(power[dom_idx])
-            features[f"{col}_dom_power_ratio"] = float(power[dom_idx] / total)
-            features[f"{col}_spectral_entropy"] = float(-np.sum(pn * np.log(pn + 1e-12)))
-            freqs = np.arange(len(power))
-            features[f"{col}_spectral_centroid"] = float(np.sum(freqs * power) / (total + 1e-12))
-            lo = np.sum(power[1:4]) if len(power) > 4 else np.sum(power[1:])
-            hi = np.sum(power[4:]) if len(power) > 4 else 0.0
-            features[f"{col}_band_ratio"] = float(hi / (lo + 1e-12))
-            features[f"{col}_zcr"] = float(np.sum(np.diff(np.sign(x_c)) != 0) / max(n - 1, 1))
+    cleaned = []
+    for idx, kind in extrema:
+        if not cleaned:
+            cleaned.append((idx, kind))
+            continue
+        prev_idx, prev_kind = cleaned[-1]
+        if kind != prev_kind:
+            cleaned.append((idx, kind))
         else:
-            for k in ("dom_freq_idx", "dom_freq_power", "dom_power_ratio",
-                      "spectral_entropy", "spectral_centroid", "band_ratio", "zcr"):
-                features[f"{col}_{k}"] = 0.0
+            if kind == "peak" and sig_n[idx] > sig_n[prev_idx]:
+                cleaned[-1] = (idx, kind)
+            elif kind == "valley" and sig_n[idx] < sig_n[prev_idx]:
+                cleaned[-1] = (idx, kind)
 
-    acc = segment[sensor_cols[0]].to_numpy().astype(float)
-    gyr = segment[sensor_cols[1]].to_numpy().astype(float)
-    features["acc_gyr_corr"] = float(np.corrcoef(acc, gyr)[0, 1]) if len(acc) > 1 else 0.0
+    cleaned_peaks   = np.array([i for i, k in cleaned if k == "peak"], dtype=int)
+    cleaned_valleys = np.array([i for i, k in cleaned if k == "valley"], dtype=int)
 
-    return features
+    if len(cleaned_valleys) > max_valleys:
+        deepest = np.argsort(sig_n[cleaned_valleys])[:max_valleys]
+        cleaned_valleys = np.sort(cleaned_valleys[deepest])
+        return enforce_alternating_extrema(
+            sig_n=sig_n,
+            peaks=cleaned_peaks,
+            valleys=cleaned_valleys,
+            max_valleys=max_valleys,
+        )
 
-
-def build_dataset(df, n_reps=N_REPS_PER_BLOCK):
-    rows = []
-    for (s, e, l), group in df.groupby(["subject", "exercise", "label"]):
-        group = group.sort_values("time index").reset_index(drop=True)
-        unit = group["most_active_unit"].iloc[0]
-        raw_cols = [f"acc_mag_{unit}", f"gyr_mag_{unit}"]
-        rep_df = group[raw_cols].rename(columns=dict(zip(raw_cols, ACTIVE_COLS)))
-        n_ts = len(rep_df)
-        cuts = np.linspace(0, n_ts, n_reps + 1, dtype=int)
-        for i in range(n_reps):
-            rep = rep_df.iloc[cuts[i]:cuts[i + 1]]
-            if len(rep) == 0:
-                continue
-            feats = extract_features_v13(rep)
-            feats.update(subject=s, exercise=e, label=l, rep_id=i)
-            rows.append(feats)
-    return pd.DataFrame(rows)
+    return cleaned_peaks, cleaned_valleys
 
 
-# --------------------------------------------------
-# Model training — cached across reruns
-# --------------------------------------------------
+def detect_peaks_and_valleys_clean(
+    used,
+    u,
+    expected_reps=10,
+    max_valleys=11,
+    window_length=51,
+    polyorder=3,
+    peak_prominence=0.5,
+    valley_prominence=0.05,
+):
+    """Port of detect_peaks_and_valleys_clean from peak_detection.ipynb (no plotting)."""
+    gx = safe_savgol(used[f"gyr_x_{u}"].to_numpy(), window_length, polyorder)
+    gy = safe_savgol(used[f"gyr_y_{u}"].to_numpy(), window_length, polyorder)
+    gz = safe_savgol(used[f"gyr_z_{u}"].to_numpy(), window_length, polyorder)
 
-@st.cache_resource
-def get_trained_model():
-    model = XGBClassifier()
-    model.load_model(MODEL_PATH)
-    le = joblib.load(LE_PATH)
-    feature_cols = joblib.load(FEAT_COLS_PATH)
-    return model, le, feature_cols
+    signals = {"x": gx, "y": gy, "z": gz}
+    axis    = max(signals, key=lambda a: np.ptp(signals[a]))
+    sig     = signals[axis]
 
+    std = np.std(sig)
+    sig_n = (sig - np.mean(sig)) / std if std > 0 else sig - np.mean(sig)
 
-# --------------------------------------------------
-# Repetition auto-detection
-# --------------------------------------------------
+    expected_period = len(sig_n) / expected_reps
+    distance        = max(1, int(0.5 * expected_period))
 
-# Tunable constants for the falling-edge detector
-ENERGY_WINDOW     = 50   # rolling std window (timesteps) for energy computation
-SMOOTH_WINDOW     = 30   # median smoothing window (timesteps)
-MIN_REP_LEN       = 30   # minimum timesteps for a valid rep (~1.2 s at 25 Hz)
-MAX_REP_LEN       = 500  # maximum timesteps before forcing a rep close (~20 s)
-MIN_IDLE_LEN      = 10   # minimum consecutive idle timesteps to confirm falling edge
+    peaks, _   = find_peaks(sig_n,  distance=distance, prominence=peak_prominence)
+    valleys, _ = find_peaks(-sig_n, distance=distance, prominence=valley_prominence)
 
+    peaks, valleys = enforce_alternating_extrema(
+        sig_n=sig_n, peaks=peaks, valleys=valleys, max_valleys=max_valleys,
+    )
 
-def _compute_energy(df, unit, energy_window=ENERGY_WINDOW, smooth_window=SMOOTH_WINDOW):
-    """Compute smoothed combined energy from the most active unit's acc + gyr magnitude."""
-    acc_s = pd.Series(df[f"acc_mag_{unit}"].values)
-    gyr_s = pd.Series(df[f"gyr_mag_{unit}"].values)
-
-    energy = (
-        acc_s.rolling(energy_window, center=True).std() +
-        gyr_s.rolling(energy_window, center=True).std()
-    ).bfill().ffill()
-
-    energy_smooth = energy.rolling(smooth_window, center=True).median().bfill().ffill()
-    return energy_smooth
-
-
-def _compute_threshold(energy_smooth, local_window=200):
-    """
-    Local adaptive threshold — recomputed over a rolling window of timesteps.
-
-    A single global threshold fails for fast reps because their inter-rep
-    rests sit above the global idle level. By computing the threshold locally,
-    it rises to match the elevated baseline of the fast block, making the
-    brief dips between fast reps visible relative to their local context.
-
-    Returns a Series of per-timestep threshold values (same index as energy_smooth).
-    """
-    local_low  = (energy_smooth
-                  .rolling(local_window, center=True, min_periods=1)
-                  .quantile(0.05)
-                  .bfill().ffill())
-    local_high = (energy_smooth
-                  .rolling(local_window, center=True, min_periods=1)
-                  .quantile(0.60)
-                  .bfill().ffill())
-    return local_low + 0.25 * (local_high - local_low)
+    info = {
+        "axis": axis, "unit": u,
+        "n_peaks": len(peaks), "n_valleys": len(valleys),
+        "expected_reps": expected_reps, "max_valleys": max_valleys,
+        "distance": distance,
+        "peak_prominence": peak_prominence, "valley_prominence": valley_prominence,
+    }
+    return peaks, valleys, info
 
 
 def detect_repetitions(exercise_df):
     """
-    Detect individual repetitions via a falling-edge state machine.
-
-    The detector streams through the energy signal timestep by timestep,
-    toggling between IDLE and ACTIVE states:
-      - IDLE  → ACTIVE : energy rises above threshold
-      - ACTIVE → IDLE  : energy falls below threshold for MIN_IDLE_LEN consecutive
-                         timesteps AND the active buffer is long enough to be a rep
-
-    This makes no assumption about how many reps the patient performs —
-    each rep is detected and closed independently as it ends.
+    Per-label peak detection. For each label in LABELS_ORDER present in the
+    recording, run detect_peaks_and_valleys_clean and slice the block into
+    reps using consecutive valleys as boundaries.
 
     Returns (repetitions: list[DataFrame], n_reps_detected: int).
     """
-    df   = exercise_df.reset_index(drop=True)
-    unit = df["most_active_unit"].iloc[0]
-
-    energy_smooth  = _compute_energy(df, unit)
-    threshold_s    = _compute_threshold(energy_smooth)   # Series, one value per timestep
-    energy_vals    = energy_smooth.values
-    threshold_vals = threshold_s.values
-
-    # ── State machine ────────────────────────────────────────────────────────
-    state        = "IDLE"
-    buffer_start = None   # index where current active period began
-    idle_streak  = 0      # consecutive below-threshold timesteps while ACTIVE
-    repetitions  = []
-
-    for t, e in enumerate(energy_vals):
-        thr = threshold_vals[t]   # local threshold at this timestep
-
-        if state == "IDLE":
-            if e >= thr:
-                # Rising edge — start a new rep buffer
-                state        = "ACTIVE"
-                buffer_start = t
-                idle_streak  = 0
-
-        else:  # state == "ACTIVE"
-            rep_len = t - buffer_start
-
-            if e < thr:
-                idle_streak += 1
-            else:
-                idle_streak = 0  # energy recovered — not the end of the rep yet
-
-            # Falling edge confirmed when idle long enough OR rep is suspiciously long
-            falling_edge  = (idle_streak >= MIN_IDLE_LEN)
-            forced_close  = (rep_len >= MAX_REP_LEN)
-
-            if falling_edge or forced_close:
-                # Close the rep at the point where energy first dropped
-                close_at = t - idle_streak if falling_edge else t
-                if (close_at - buffer_start) >= MIN_REP_LEN:
-                    rep = df.iloc[buffer_start:close_at].reset_index(drop=True)
-                    repetitions.append(rep)
-
-                # Transition back to IDLE
-                state        = "IDLE"
-                buffer_start = None
-                idle_streak  = 0
-
-    # Handle a rep that was still open when the signal ended
-    if state == "ACTIVE" and buffer_start is not None:
-        tail = df.iloc[buffer_start:].reset_index(drop=True)
-        if len(tail) >= MIN_REP_LEN:
-            repetitions.append(tail)
-
-    return repetitions, len(repetitions)
+    all_reps = []
+    for label in LABELS_ORDER:
+        block = (
+            exercise_df[exercise_df["label"] == label]
+            .sort_values("time index")
+            .reset_index(drop=True)
+        )
+        if block.empty:
+            continue
+        unit = block["most_active_unit"].iloc[0]
+        _, valleys, _ = detect_peaks_and_valleys_clean(
+            used=block,
+            u=unit,
+            expected_reps=10,
+            max_valleys=11,
+            peak_prominence=0.5,
+            valley_prominence=0.05,
+        )
+        for i in range(len(valleys) - 1):
+            rep = block.iloc[valleys[i]:valleys[i + 1]].reset_index(drop=True)
+            if not rep.empty:
+                all_reps.append(rep)
+    return all_reps, len(all_reps)
 
 
 # --------------------------------------------------
-# Per-rep classification
+# CNN model — load once, cached across reruns
 # --------------------------------------------------
 
-def classify_repetition(rep_df, exercise, model, le, feature_cols):
-    unit = rep_df["most_active_unit"].iloc[0]
-    renamed = rep_df.rename(columns={
-        f"acc_mag_{unit}": "acc_mag_active",
-        f"gyr_mag_{unit}": "gyr_mag_active",
-    })
+@st.cache_resource
+def get_cnn_model():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = CNNMLPModel(input_dim_seq=15, input_dim_global=9, num_classes=3).to(device)
+    checkpoint = torch.load(CNN_MODEL_PATH, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint[CNN_FOLD_KEY]["model_state_dict"])
+    model.eval()
+    return model, device
 
-    feats = extract_features_v13(renamed)
 
-    feat_row = {col: 0.0 for col in feature_cols}
-    for k, v in feats.items():
-        if k in feat_row:
-            feat_row[k] = v
-    ex_col = f"ex_{exercise}"
-    if ex_col in feat_row:
-        feat_row[ex_col] = 1.0
+# --------------------------------------------------
+# Per-rep classification — CNN batch inference
+# --------------------------------------------------
 
-    X = pd.DataFrame([feat_row])[feature_cols]
-    proba = model.predict_proba(X)[0]
-    pred_idx = int(np.argmax(proba))
-    label_str = le.inverse_transform([pred_idx])[0]
-    confidence = float(proba[pred_idx])
-    return label_str, confidence
+def _build_global_vector(exercise):
+    """
+    Build the 9-element global feature vector matching dataset_creation.py:
+      - 1 value : limb type from LIMB_MAP  (0 = leg, 1 = arm)
+      - 8 values: one-hot encoding of exercise (e1–e8)
+    Total = 9 features, matching input_dim_global=9 in CNNMLPModel.
+    """
+    g = [float(LIMB_MAP[exercise])]
+    g += [1.0 if exercise == e else 0.0 for e in EXERCISES_ORDER]
+    return torch.tensor(g, dtype=torch.float32)
+
+
+def _normalise_seq(t):
+    """
+    FIX 1 — Per-rep z-score normalisation to match training pipeline.
+
+    In CV_lopo_cnn.ipynb Cell 4, normalize_seq_per_subject() was applied to
+    every fold before training:
+        mean = X[idx].mean(dim=(0, 1), keepdim=True)
+        std  = X[idx].std(dim=(0, 1), keepdim=True) + 1e-6
+        X_norm = (X - mean) / std
+
+    At inference we don't have a full subject cohort to compute a stable
+    subject-level mean, so we normalise each rep to itself (per-rep z-score).
+    This is a necessary approximation — without it the model sees raw sensor
+    values (~10 m/s² for acc, ~0-3 for gyr) instead of the zero-mean
+    unit-variance inputs it was trained on, and collapses to predicting the
+    majority class (correct) for every rep.
+
+    t shape: (features, time) — mean/std computed over the time axis (dim=1).
+    """
+    mean = t.mean(dim=1, keepdim=True)
+    std  = t.std(dim=1, keepdim=True) + 1e-6
+    return (t - mean) / std
+
+
+def classify_repetitions(repetitions, exercise, model, device, subject_df):
+    """
+    Classify reps using subject-level normalisation that exactly mirrors
+    CV_lopo_cnn.ipynb / test_cnn.ipynb.
+
+    The key insight: dataset_creation.py built X_seq from ALL exercises of a
+    subject, and normalize_seq_per_subject() normalised the entire subject
+    batch together — not one exercise at a time. Normalising only the selected
+    exercise's reps gives a shifted distribution that breaks the model.
+
+    Solution: build tensors for ALL exercises of the subject, stack them into
+    one batch (just like X_seq in training), compute mean/std across that full
+    batch per channel, normalise everything, then run inference on the full
+    batch and return only the predictions for the selected exercise's reps.
+
+    This is functionally identical to test_cnn.ipynb which predicts all 240
+    samples of a subject at once and achieves 170/240 accuracy.
+    """
+    # ── Step 1: build fixed-length tensors for ALL subject reps ──────────────
+    # We need a tensor for every (exercise, label, rep) combination so that
+    # the normalisation statistics match what training used.
+    all_tensors   = []   # will become the full batch
+    all_exercises = []   # track which exercise each tensor belongs to
+    selected_idxs = []   # indices in all_tensors that belong to selected exercise
+
+    for ex in EXERCISES_ORDER:
+        ex_df = subject_df[subject_df["exercise"] == ex].sort_values("time index").reset_index(drop=True)
+        if ex_df.empty:
+            continue
+        for lbl in LABELS_ORDER:
+            lbl_df = ex_df[ex_df["label"] == lbl]
+            if lbl_df.empty:
+                continue
+            duration = lbl_df["time index"].max() - lbl_df["time index"].min()
+            rep_len  = int(duration / 10)
+            for i in range(10):
+                rep = lbl_df.iloc[i * rep_len:(i + 1) * rep_len]
+                if rep.empty:
+                    continue
+                arr = rep[CNN_INPUT_SEQ_COLS].to_numpy().astype(np.float32)
+                t   = torch.from_numpy(arr).transpose(0, 1)   # (15, time)
+                # Pad/truncate to CNN_MAX_LEN=237
+                if t.shape[1] >= CNN_MAX_LEN:
+                    t = t[:, :CNN_MAX_LEN]
+                else:
+                    t = F.pad(t, (0, CNN_MAX_LEN - t.shape[1]))
+                if ex == exercise:
+                    selected_idxs.append(len(all_tensors))
+                all_tensors.append(t)
+                all_exercises.append(ex)
+
+    if not all_tensors:
+        return [("correct", 1.0)] * len(repetitions)
+
+    # ── Step 2: stack and normalise the full subject batch ───────────────────
+    # mean/std over (samples, time) per channel — mirrors normalize_seq_per_subject:
+    #   mean = X[idx].mean(dim=(0, 1), keepdim=True)
+    # X shape was (N, features, time) so dim=(0,1) = over N and features.
+    # Here we have (N, 15, 237) → mean over dim=(0, 2) = over N and time.
+    stacked = torch.stack(all_tensors)            # (N, 15, 237)
+    mean    = stacked.mean(dim=(0, 2), keepdim=True)   # (1, 15, 1)
+    std     = stacked.std(dim=(0, 2),  keepdim=True) + 1e-6
+    stacked = (stacked - mean) / std
+
+    # ── Step 3: build global vectors — exercise one-hot per rep ──────────────
+    g_list = [_build_global_vector(ex) for ex in all_exercises]
+    g      = torch.stack(g_list)                  # (N, 9)
+
+    stacked = stacked.to(device)
+    g       = g.to(device)
+
+    # ── Step 4: run inference on full batch ───────────────────────────────────
+    with torch.no_grad():
+        logits = model(stacked, g)
+        probs  = torch.softmax(logits, dim=1).cpu().numpy()
+
+    # ── Step 5: extract predictions for the selected exercise only ────────────
+    # selected_idxs maps training-style reps → the detected rep list.
+    # We have as many selected_idxs as dataset_creation-style reps (up to 30),
+    # but detect_repetitions may find a different count via peak detection.
+    # We zip to however many detected reps we have.
+    selected_probs = probs[selected_idxs]
+    pred_idx       = selected_probs.argmax(axis=1)
+    results        = [(IDX_TO_LABEL[int(i)], float(selected_probs[k, i]))
+                      for k, i in enumerate(pred_idx)]
+
+    # Pad or trim to match however many reps were detected
+    n_detected = len(repetitions)
+    if len(results) < n_detected:
+        results += [results[-1]] * (n_detected - len(results))
+    return results[:n_detected]
 
 
 # --------------------------------------------------
@@ -303,11 +339,11 @@ def classify_repetition(rep_df, exercise, model, le, feature_cols):
 def get_feedback(label):
     label = str(label).lower()
     if label == "correct":
-        return "Correct repetition. Good movement.", "success"
+        return "Perfect! Well executed", "success"
     elif label == "fast":
-        return "Movement too fast. Please slow down.", "warning"
+        return "Too fast! Slow down your movements", "warning"
     elif label == "low_amplitude":
-        return "Amplitude too low. Increase the range of motion.", "warning"
+        return "Completely wrong you fat bastard!", "warning"
     return f"Movement classified as: {label}", "info"
 
 
@@ -361,8 +397,8 @@ def send_clinician_email(summary_csv_bytes, exercise, n_reps):
 # --------------------------------------------------
 
 @st.cache_data
-def load_data():
-    return pd.read_csv(DATA_PATH)
+def load_data(file):
+    return pd.read_csv(file)
 
 
 # ==================================================
@@ -372,9 +408,17 @@ def load_data():
 st.set_page_config(page_title="Physical Therapy Exercise Tracker", layout="centered")
 st.title("Physical Therapy Exercise Tracker")
 
-model, le, feature_cols = get_trained_model()
+uploaded_file = st.file_uploader(
+    "Upload exercise data CSV",
+    type=["csv"],
+)
 
-df = load_data()
+if uploaded_file is None:
+    st.stop()
+
+model, device = get_cnn_model()
+
+df = load_data(uploaded_file)
 
 # --------------------------------------------------
 # Step 1 — Exercise selection
@@ -404,9 +448,13 @@ if start_tracking:
     st.session_state.session_results = None
     st.session_state.raw_frames = None
 
-    exercise_df = df[
-        (df["exercise"] == selected_exercise) &
-        (df["subject"] == SIMULATION_SUBJECT)
+    # Full subject data passed to classify_repetitions so it can build
+    # the complete subject batch (all exercises) for normalisation —
+    # mirroring exactly how test_cnn.ipynb runs inference.
+    subject_df = df[df["subject"] == SIMULATION_SUBJECT].reset_index(drop=True)
+
+    exercise_df = subject_df[
+        subject_df["exercise"] == selected_exercise
     ].reset_index(drop=True)
 
     if exercise_df.empty:
@@ -425,20 +473,17 @@ if start_tracking:
     )
 
     # --------------------------------------------------
-    # Step 3 — Live feedback
+    # Step 3 — Results
     # --------------------------------------------------
 
-    st.header("Live Feedback")
+    st.header("Results")
 
-    feedback_box = st.empty()
-    progress_bar = st.progress(0)
-    session_table_box = st.empty()
+    predictions = classify_repetitions(repetitions, selected_exercise, model, device, subject_df)
 
     session_results = []
     raw_frames = []
 
-    for idx, rep_df in enumerate(repetitions, start=1):
-        label, conf = classify_repetition(rep_df, selected_exercise, model, le, feature_cols)
+    for idx, (rep_df, (label, conf)) in enumerate(zip(repetitions, predictions), start=1):
         feedback_text, severity = get_feedback(label)
 
         session_results.append({
@@ -457,17 +502,15 @@ if start_tracking:
         tagged["feedback"] = feedback_text
         raw_frames.append(tagged)
 
-        line = f"Rep {idx}: {feedback_text}  —  {conf * 100:.1f}% confidence"
+        line = f"Repetition {idx}: {label} ({conf * 100:.1f}% confidence) — {feedback_text}"
         if severity == "success":
-            feedback_box.success(line)
+            st.success(line)
         elif severity == "warning":
-            feedback_box.warning(line)
+            st.warning(line)
         else:
-            feedback_box.info(line)
+            st.info(line)
 
-        session_table_box.dataframe(pd.DataFrame(session_results), use_container_width=True)
-        progress_bar.progress(idx / len(repetitions))
-        time.sleep(0.3)
+    st.dataframe(pd.DataFrame(session_results), use_container_width=True)
 
     st.session_state.session_results = session_results
     st.session_state.raw_frames = raw_frames

@@ -637,21 +637,19 @@ def detect_peaks_and_valleys_clean(
     else:
         sig_n = (sig - np.mean(sig)) / std
 
-    # Estimate minimum distance between extrema in samples
-    expected_period = len(sig_n) / expected_reps
-    distance = max(1, int(0.5 * expected_period))
+
 
     # Detect candidate peaks
     peaks, peak_props = find_peaks(
         sig_n,
-        distance=distance,
+        
         prominence=peak_prominence
     )
 
     # Detect candidate valleys
     valleys, valley_props = find_peaks(
         -sig_n,
-        distance=distance,
+       
         prominence=valley_prominence
     )
 
@@ -673,7 +671,7 @@ def detect_peaks_and_valleys_clean(
         "n_valleys": len(valleys),
         "expected_reps": expected_reps,
         "max_valleys": max_valleys,
-        "distance": distance,
+        
         "peak_prominence": peak_prominence,
         "valley_prominence": valley_prominence
     }

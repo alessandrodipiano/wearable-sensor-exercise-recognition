@@ -43,11 +43,7 @@ class CNNMLPModel0(nn.Module):
             nn.BatchNorm1d(64),
             nn.ReLU(),
 
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-
-            nn.Conv1d(128, 128, kernel_size=3, padding=1),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
 
@@ -115,7 +111,7 @@ class CNNMLPModel(nn.Module):
         use_seq=True,
         use_ex=True,
         use_info=True,
-        dropout=0.2,
+        dropout=0.5,
     ):
         super().__init__()
 
@@ -123,51 +119,38 @@ class CNNMLPModel(nn.Module):
         self.use_ex = use_ex
         self.use_info = use_info
 
-        
-
         fusion_dim = 0
 
         if self.use_seq:
-            
-
-            
             self.features = nn.Sequential(
-            nn.Conv1d(input_dim_seq, 64, kernel_size=7, padding=3),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
+                nn.Conv1d(input_dim_seq, 64, kernel_size=7, padding=3),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
 
-            nn.Conv1d(64, 128, kernel_size=5, padding=2),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=5, padding=2),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.MaxPool1d(2),
+                nn.Dropout(dropout),
 
-            nn.Conv1d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
+                nn.Conv1d(128, 128, kernel_size=3, padding=1),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Dropout(dropout),
 
-            nn.MaxPool1d(kernel_size=2),
-            nn.Dropout(0.3),
+                nn.AdaptiveAvgPool1d(1)
+            )
 
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-
-            nn.AdaptiveAvgPool1d(1)
-        )
-
-            
-
-            self.seq_out_dim = 256
+            self.seq_out_dim = 128
             fusion_dim += self.seq_out_dim
 
         if self.use_ex:
-            
-
             self.ex_mlp = nn.Sequential(
                 nn.Linear(input_dim_exercise, 32),
                 nn.ReLU(),
                 nn.LayerNorm(32),
                 nn.Dropout(dropout),
-
                 nn.Linear(32, 16),
                 nn.ReLU(),
             )
@@ -176,14 +159,11 @@ class CNNMLPModel(nn.Module):
             fusion_dim += self.ex_out_dim
 
         if self.use_info:
-            
-
             self.info_mlp = nn.Sequential(
                 nn.Linear(input_dim_info, 32),
                 nn.ReLU(),
                 nn.LayerNorm(32),
                 nn.Dropout(dropout),
-
                 nn.Linear(32, 16),
                 nn.ReLU(),
             )
@@ -192,7 +172,10 @@ class CNNMLPModel(nn.Module):
             fusion_dim += self.info_out_dim
 
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim, 32),
+            nn.Linear(fusion_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(32, num_classes),
@@ -202,21 +185,15 @@ class CNNMLPModel(nn.Module):
         branches = []
 
         if self.use_seq:
-            
-
             h_seq = self.features(x_seq)
             h_seq = torch.flatten(h_seq, start_dim=1)
             branches.append(h_seq)
 
         if self.use_ex:
-            
-
             h_ex = self.ex_mlp(x_ex)
             branches.append(h_ex)
 
         if self.use_info:
-            
-
             h_info = self.info_mlp(x_info)
             branches.append(h_info)
 
